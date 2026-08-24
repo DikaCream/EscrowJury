@@ -95,8 +95,4 @@ For evidence integrity, every submission passes through `Keccak256(evidence_deta
 
 31 direct tests covering escrow lifecycle, evidence validation, hash binding, adjudication mocks, stale closing, and full-path integration.
 
-**Live on StudioNet:** `0xa9A2F7422D4d56153989287bF601Bb5Cb8aEa14A` ([Studio explorer](https://explorer-studio.genlayer.com/address/0xa9A2F7422D4d56153989287bF601Bb5Cb8aEa14A))</think>Now commit and push
-
-<｜DSML｜tool_calls>
-<｜DSML｜invoke name="run_terminal_command">
-<｜DSML｜parameter name="command" string="true">git add -A && git status --short && git diff --cached --check
+**Live on StudioNet:** `0xa9A2F7422D4d56153989287bF601Bb5Cb8aEa14A` ([Studio explorer](https://explorer-studio.genlayer.com/address/0xa9A2F7422D4d56153989287bF601Bb5Cb8aEa14A) 
