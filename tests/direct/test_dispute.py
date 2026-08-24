@@ -204,6 +204,78 @@ def test_cannot_close_non_stale(direct_vm, direct_deploy, direct_alice, direct_b
         contract.close_stale_dispute(did)
 
 
+def test_retry_dispute_after_failure(direct_vm, direct_deploy, direct_alice, direct_bob):
+    contract = direct_deploy("contracts/escrow_jury.py")
+    eid = create_escrow(contract, direct_vm, direct_alice, direct_bob)
+    did = _file(direct_vm, contract, eid, direct_alice)
+
+    submit_evidence(direct_vm, contract, did, "EXECUTION_LOG", DEPOSITOR_EVIDENCE_HASH, DEPOSITOR_EVIDENCE, direct_alice)
+    submit_evidence(direct_vm, contract, did, "TRANSACTION_RECEIPT", RECIPIENT_EVIDENCE_HASH, RECIPIENT_EVIDENCE, direct_bob)
+
+    set_time("2030-01-02T00:00:00Z")
+    # First attempt: simulate an unparseable verdict
+    mock_adjudication(direct_vm, delivery_pct=-1, quality_pct=-1)
+
+    try:
+        contract.finalize_dispute(did)
+    except Exception:
+        pass
+
+    d = contract.get_dispute(did)
+    assert d["status"] == "OPEN"
+    assert d["attempts"] == 1
+
+    # Clear old mock and set a new one for the retry
+    direct_vm.clear_mocks()
+    set_time("2030-01-02T00:10:00Z")  # past throttle
+    mock_adjudication(direct_vm, delivery_pct=100, quality_pct=100)
+
+    contract.retry_dispute(did)
+
+    d = contract.get_dispute(did)
+    assert d["status"] == "RESOLVED"
+    assert d["delivery_pct"] == 100
+    assert d["quality_pct"] == 100
+    assert d["attempts"] == 2
+
+
+def test_retry_dispute_throttled(direct_vm, direct_deploy, direct_alice, direct_bob):
+    contract = direct_deploy("contracts/escrow_jury.py")
+    eid = create_escrow(contract, direct_vm, direct_alice, direct_bob)
+    did = _file(direct_vm, contract, eid, direct_alice)
+
+    submit_evidence(direct_vm, contract, did, "EXECUTION_LOG", DEPOSITOR_EVIDENCE_HASH, DEPOSITOR_EVIDENCE, direct_alice)
+    submit_evidence(direct_vm, contract, did, "TRANSACTION_RECEIPT", RECIPIENT_EVIDENCE_HASH, RECIPIENT_EVIDENCE, direct_bob)
+
+    set_time("2030-01-02T00:00:00Z")
+    mock_adjudication(direct_vm, delivery_pct=-1, quality_pct=-1)
+    try:
+        contract.finalize_dispute(did)
+    except Exception:
+        pass
+    direct_vm.clear_mocks()
+
+    # Retry immediately — same timestamp, should be throttled
+    with direct_vm.expect_revert("adjudication is throttled"):
+        contract.retry_dispute(did)
+
+
+def test_cannot_retry_resolved(direct_vm, direct_deploy, direct_alice, direct_bob):
+    contract = direct_deploy("contracts/escrow_jury.py")
+    eid = create_escrow(contract, direct_vm, direct_alice, direct_bob)
+    did = _file(direct_vm, contract, eid, direct_alice)
+
+    submit_evidence(direct_vm, contract, did, "EXECUTION_LOG", DEPOSITOR_EVIDENCE_HASH, DEPOSITOR_EVIDENCE, direct_alice)
+    submit_evidence(direct_vm, contract, did, "TRANSACTION_RECEIPT", RECIPIENT_EVIDENCE_HASH, RECIPIENT_EVIDENCE, direct_bob)
+
+    set_time("2030-01-02T00:00:00Z")
+    mock_adjudication(direct_vm, delivery_pct=100, quality_pct=100)
+    contract.finalize_dispute(did)
+
+    with direct_vm.expect_revert("dispute must be in OPEN state"):
+        contract.retry_dispute(did)
+
+
 def test_get_dispute_missing_returns_none(direct_deploy):
     contract = direct_deploy("contracts/escrow_jury.py")
     assert contract.get_dispute(999) is None
