@@ -95,4 +95,4 @@ For evidence integrity, every submission passes through `Keccak256(evidence_deta
 
 31 direct tests covering escrow lifecycle, evidence validation, hash binding, adjudication mocks, stale closing, and full-path integration.
 
-**Live on StudioNet:** `0xa9A2F7422D4d56153989287bF601Bb5Cb8aEa14A` ([Studio explorer](https://explorer-studio.genlayer.com/address/0xa9A2F7422D4d56153989287bF601Bb5Cb8aEa14A) 
+**Live on StudioNet:** `0x127b77569F2d124eC3bb81308fD012ef26F5DfbC` ([Studio explorer](https://explorer-studio.genlayer.com/address/0x127b77569F2d124eC3bb81308fD012ef26F5DfbC))

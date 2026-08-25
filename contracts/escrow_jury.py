@@ -61,6 +61,7 @@ ACTIVE = "ACTIVE"
 RELEASED = "RELEASED"
 REFUNDED = "REFUNDED"
 DISPUTED = "DISPUTED"
+SETTLED = "SETTLED"
 # Dispute statuses
 PENDING_EVIDENCE = "PENDING_EVIDENCE"
 OPEN = "OPEN"
@@ -110,7 +111,7 @@ class Escrow:
     amount: u256  # GEN deposited into escrow
     terms_hash: str
     terms_snapshot: str
-    status: str  # ACTIVE | RELEASED | REFUNDED | DISPUTED
+    status: str  # ACTIVE | RELEASED | REFUNDED | DISPUTED | SETTLED
     created_at: u256
     auto_release_deadline: u256
     dispute_id: u256
@@ -180,6 +181,12 @@ class EscrowJury(gl.Contract):
             raise gl.vm.UserError("dispute not found")
         return d
 
+    def _decrement_locked(self, amount: int):
+        locked = int(self.escrow_locked)
+        if locked < amount:
+            raise gl.vm.UserError("escrow locked underflow; escrow already settled?")
+        self.escrow_locked = u256(locked - amount)
+
     # ── escrow lifecycle ────────────────────────────────────────────────
 
     @gl.public.write.payable
@@ -190,9 +197,12 @@ class EscrowJury(gl.Contract):
         evidence_window_days: u256,
         auto_release_days: u256,
     ) -> u256:
-        # The calldata roundtrip in direct tests may deliver Address as
-        # raw bytes; convert back so storage serialization works.
+        # The calldata roundtrip may deliver Address as raw bytes (direct
+        # tests) or as a plain hex string (Python SDK). Convert anything
+        # that isn't already an Address object.
         if isinstance(recipient, bytes):
+            recipient = Address(recipient)
+        elif isinstance(recipient, str):
             recipient = Address(recipient)
 
         value = int(gl.message.value)
@@ -248,7 +258,7 @@ class EscrowJury(gl.Contract):
 
         e.status = RELEASED
         self.escrows[escrow_id] = e
-        self.escrow_locked = u256(int(self.escrow_locked) - int(e.amount))
+        self._decrement_locked(int(e.amount))
         _NativeRecipient(e.recipient).emit_transfer(value=u256(e.amount))
 
     @gl.public.write
@@ -261,7 +271,7 @@ class EscrowJury(gl.Contract):
 
         e.status = REFUNDED
         self.escrows[escrow_id] = e
-        self.escrow_locked = u256(int(self.escrow_locked) - int(e.amount))
+        self._decrement_locked(int(e.amount))
         _NativeRecipient(e.depositor).emit_transfer(value=u256(e.amount))
 
     # ── dispute ─────────────────────────────────────────────────────────
@@ -412,11 +422,17 @@ class EscrowJury(gl.Contract):
             raise gl.vm.UserError("dispute is not resolved")
 
         e = self._escrow_or_revert(d.escrow_id)
+        if e.status == SETTLED:
+            raise gl.vm.UserError("escrow already settled")
+
         product = int(d.delivery_pct) * int(d.quality_pct)  # 0..10000
         to_recipient = (int(e.amount) * product) // 10000
         to_depositor = int(e.amount) - to_recipient
 
-        self.escrow_locked = u256(int(self.escrow_locked) - int(e.amount))
+        self._decrement_locked(int(e.amount))
+
+        e.status = SETTLED
+        self.escrows[d.escrow_id] = e
 
         if to_recipient > 0:
             _NativeRecipient(e.recipient).emit_transfer(value=u256(to_recipient))
@@ -440,7 +456,7 @@ class EscrowJury(gl.Contract):
         d.status = RESOLVED
         self.disputes[dispute_id] = d
 
-        self.escrow_locked = u256(int(self.escrow_locked) - int(e.amount))
+        self._decrement_locked(int(e.amount))
         _NativeRecipient(e.depositor).emit_transfer(value=u256(e.amount))
 
     # ── adjudication ────────────────────────────────────────────────────
@@ -609,6 +625,8 @@ an "error" key, they are equivalent only if both contain an "error" key."""
     def list_depositor_escrows(self, address: Address, offset: u256, limit: u256) -> typing.Any:
         if isinstance(address, bytes):
             address = Address(address)
+        elif isinstance(address, str):
+            address = Address(address)
         ids = self.depositor_index.get_or_insert_default(address)
         results: list = []
         for idx in range(int(offset), min(int(offset) + int(limit), len(ids))):
@@ -630,6 +648,8 @@ an "error" key, they are equivalent only if both contain an "error" key."""
     @gl.public.view
     def list_recipient_escrows(self, address: Address, offset: u256, limit: u256) -> typing.Any:
         if isinstance(address, bytes):
+            address = Address(address)
+        elif isinstance(address, str):
             address = Address(address)
         ids = self.recipient_index.get_or_insert_default(address)
         results: list = []

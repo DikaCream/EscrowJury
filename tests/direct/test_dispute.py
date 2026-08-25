@@ -181,6 +181,29 @@ def test_partial_payout(direct_vm, direct_deploy, direct_alice, direct_bob):
     assert d["quality_pct"] == 50
 
 
+def test_settle_dispute_payout_and_guard(direct_vm, direct_deploy, direct_alice, direct_bob):
+    contract = direct_deploy("contracts/escrow_jury.py")
+    eid = create_escrow(contract, direct_vm, direct_alice, direct_bob, amount=1000)
+    did = _file(direct_vm, contract, eid, direct_alice)
+
+    submit_evidence(direct_vm, contract, did, "EXECUTION_LOG", DEPOSITOR_EVIDENCE_HASH, DEPOSITOR_EVIDENCE, direct_alice)
+    submit_evidence(direct_vm, contract, did, "TRANSACTION_RECEIPT", RECIPIENT_EVIDENCE_HASH, RECIPIENT_EVIDENCE, direct_bob)
+
+    set_time("2030-01-02T00:00:00Z")
+    mock_adjudication(direct_vm, delivery_pct=80, quality_pct=50)
+    contract.finalize_dispute(did)
+
+    before = int(contract.get_config()["escrow_locked"])
+    contract.settle_dispute(did)
+
+    e = contract.get_escrow(eid)
+    assert e["status"] == "SETTLED"
+    assert int(contract.get_config()["escrow_locked"]) == before - 1000
+
+    with direct_vm.expect_revert("escrow already settled"):
+        contract.settle_dispute(did)
+
+
 def test_close_stale_dispute(direct_vm, direct_deploy, direct_alice, direct_bob):
     contract = direct_deploy("contracts/escrow_jury.py")
     eid = create_escrow(contract, direct_vm, direct_alice, direct_bob)
