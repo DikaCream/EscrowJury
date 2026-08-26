@@ -4,11 +4,11 @@ from tests.direct.conftest import (
     TERMS,
     SHORT_REASON,
     DEPOSITOR_EVIDENCE,
-    DEPOSITOR_EVIDENCE_HASH,
     RECIPIENT_EVIDENCE,
-    RECIPIENT_EVIDENCE_HASH,
+    ARTIFACT_URL,
     create_escrow,
     submit_evidence,
+    mock_artifact,
     mock_adjudication,
     set_time,
 )
@@ -40,13 +40,17 @@ def test_smoke_full_path(direct_vm, direct_deploy, direct_alice, direct_bob):
     d = contract.get_dispute(did)
     assert d["status"] == "PENDING_EVIDENCE"
 
-    # 4. Submit evidence on both sides
-    submit_evidence(direct_vm, contract, did, "EXECUTION_LOG", DEPOSITOR_EVIDENCE_HASH, DEPOSITOR_EVIDENCE, direct_alice)
-    submit_evidence(direct_vm, contract, did, "ERROR_REPORT", RECIPIENT_EVIDENCE_HASH, RECIPIENT_EVIDENCE, direct_bob)
+    # 4. Submit evidence on both sides; validators acquire the artifacts.
+    mock_artifact(direct_vm)
+    submit_evidence(direct_vm, contract, did, "EXECUTION_LOG", DEPOSITOR_EVIDENCE, direct_alice, url=ARTIFACT_URL)
+    submit_evidence(direct_vm, contract, did, "ERROR_REPORT", RECIPIENT_EVIDENCE, direct_bob, url=ARTIFACT_URL)
 
     d = contract.get_dispute(did)
     assert d["depositor_evidence"] == DEPOSITOR_EVIDENCE
     assert d["recipient_evidence"] == RECIPIENT_EVIDENCE
+    assert d["recipient_evidence_verified"] is True
+    assert len(d["recipient_evidence_hash"]) == 64
+    assert d["recipient_evidence_snapshot"] != ""
 
     # 5. Adjudicate and settle
     set_time("2030-01-02T00:00:00Z")

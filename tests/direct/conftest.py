@@ -10,7 +10,6 @@ import sys
 from datetime import datetime, timezone
 
 import pytest
-from eth_utils import keccak
 
 BASE_ISO = "2030-01-01T00:00:00Z"
 
@@ -54,19 +53,27 @@ SHORT_REASON = (
     "recipient after the escrow was funded."
 )
 
-DEPOSITOR_EVIDENCE = (
-    "I sent three messages via the project channel over the seven-day window "
-    "and received zero replies. Screenshot of the empty repository attached. "
-    "Timestamps: 2026-08-01 09:00, 2026-08-03 14:00, 2026-08-06 11:00."
+# The artifact validators independently acquire for the recipient's evidence.
+ARTIFACT_URL = "https://deliverable.example/landing"
+ARTIFACT_BODY = (
+    "Acme Landing Page\n"
+    "Hero section: Ship your ideas.\n"
+    "Features grid: instant deploy, edge rendering, team analytics.\n"
+    "Pricing table: Free tier, Pro $20 per month, Enterprise custom.\n"
+    "Footer: contact@acme.example\n"
 )
-DEPOSITOR_EVIDENCE_HASH = keccak(text=DEPOSITOR_EVIDENCE).hex()
+
+DEPOSITOR_EVIDENCE = (
+    "The recipient never delivered a landing page. The repository at "
+    "https://deliverable.example/landing returns nothing related to the "
+    "agreed hero, features grid, or pricing table from the terms."
+)
 
 RECIPIENT_EVIDENCE = (
-    "I delivered the first draft on 2026-08-02 via email. The depositor never "
-    "responded to my revision request. Email timestamp 2026-08-02 15:30 UTC, "
-    "message ID <abc123@project.com>."
+    "The landing page is live at https://deliverable.example/landing with the "
+    "hero section, features grid, and pricing table described in the terms. "
+    "The artifact was published on 2026-08-02."
 )
-RECIPIENT_EVIDENCE_HASH = keccak(text=RECIPIENT_EVIDENCE).hex()
 
 
 def to_hex(addr_bytes):
@@ -84,10 +91,15 @@ def create_escrow(contract, vm, depositor, recipient, amount=100, terms=TERMS):
     return int(contract.create_escrow(recipient, terms, 1, 7))
 
 
-def submit_evidence(vm, contract, dispute_id, kind, evidence_hash, details, sender):
+def mock_artifact(vm, url_pattern=ARTIFACT_URL, body=ARTIFACT_BODY):
+    """Mock web render so evidence acquisition fetches this artifact."""
+    vm.mock_web(url_pattern, {"status": 200, "body": body})
+
+
+def submit_evidence(vm, contract, dispute_id, kind, details, sender, url=""):
     """Submit one evidence record as the given sender."""
     vm.sender = sender
-    contract.submit_dispute_evidence(dispute_id, kind, evidence_hash, details)
+    contract.submit_dispute_evidence(dispute_id, kind, url, details)
 
 
 def mock_adjudication(vm, delivery_pct=100, quality_pct=100, reason="Terms were met."):

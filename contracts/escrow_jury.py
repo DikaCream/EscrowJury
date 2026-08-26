@@ -4,29 +4,32 @@ EscrowJury — escrow primitive with AI adjudication.
 
 Deposit GEN against a set of written terms. If both sides agree the terms
 were met, the depositor releases the funds to the recipient. If they can't
-agree, a quorum of GenLayer validators reads the committed terms, inspects
-the structured evidence each side stored on-chain, and rules a partial or
-full payout.
+agree, a quorum of GenLayer validators reads the committed terms and the
+independently acquired evidence, and rules a partial or full payout.
 
-Two-axis judgment
+Two-axis judgment, exact payout
     Validators score delivery (did the work actually happen?) and quality
     (was it acceptable?) on 0-100 scales. The payout ratio is the product
-    of the two divided by 100, so a zero on either axis zeroes the payout.
-    Two verdicts count as equal when their payout products land in the same
-    thousand-bucket, which means validators who weigh delivery and quality
-    differently still reach consensus as long as the resulting split is the
-    same.
+    of the two divided by 100. Consensus is bound to the EXACT canonical
+    payout (floor(amount * delivery_pct * quality_pct / 10000) in whole
+    GEN): two verdicts that imply different payouts are not equivalent,
+    no matter how close the scores are. A zero on either axis zeroes the
+    payout.
 
-Evidence that can't be faked
-    Every evidence submission stores the raw details in the dispute record,
-    hashes them with Keccak-256 on-chain, and reverts unless the claimed
-    hash matches those exact bytes. The hash is the canonical locator, so
-    there is no way to point validators at bytes the contract hasn't seen.
+Evidence the contract acquires itself
+    Evidence is an artifact URL plus a short description. At submission,
+    validators independently fetch the artifact (gl.nondet.web.render),
+    normalize it deterministically, and commit the exact bytes and their
+    Keccak-256 hash to the dispute record through consensus. Adjudication
+    judges those acquired bytes, not the parties' retellings. If an
+    artifact cannot be acquired, that evidence is marked unverified and
+    carries minimal weight.
 
-No live-URL adjudication
-    Terms are committed at escrow creation and never re-fetched. Validators
-    judge the stored snapshot, the complaint, and the authenticated evidence
-    — nothing either party can rewrite after the fact.
+Immutable commitments
+    Terms are committed at escrow creation and never re-fetched. Evidence
+    bytes are committed at submission and never re-fetched. Validators
+    judge stored snapshots — nothing either party can rewrite after the
+    fact.
 """
 from genlayer import *
 from dataclasses import dataclass
@@ -41,6 +44,8 @@ MAX_TERMS_CHARS: int = 2000
 
 MIN_EVIDENCE_CHARS: int = 20
 MAX_EVIDENCE_CHARS: int = 3000
+MAX_EVIDENCE_URL_CHARS: int = 512
+MAX_EVIDENCE_SNAPSHOT_CHARS: int = 4000
 
 VALID_EVIDENCE_KINDS: tuple[str, ...] = (
     "EXECUTION_LOG",
@@ -91,12 +96,38 @@ class _NativeRecipient:
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
-def _is_hex_digest(value: str) -> bool:
-    return len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+def _normalize_content(text: str) -> str:
+    """Deterministic normalization so dynamic pages stay comparable.
+
+    Collapses whitespace, drops blank lines, and removes consecutive
+    duplicate lines (common boilerplate) so the snapshot validators commit
+    is stable across fetches.
+    """
+    lines: list = []
+    for raw in text.splitlines():
+        line = " ".join(raw.split()).strip()
+        if not line:
+            continue
+        if lines and line == lines[-1]:
+            continue
+        lines.append(line)
+    return "\n".join(lines)
 
 
-def _canonical_evidence_reference(evidence_hash: str) -> str:
-    return "onchain://evidence/" + evidence_hash
+def _hash_text(text: str) -> str:
+    h = Keccak256()
+    h.update(text.encode("utf-8"))
+    return h.hexdigest()
+
+
+def _is_valid_evidence_url(url: str) -> bool:
+    if not url:
+        return True
+    if len(url) > MAX_EVIDENCE_URL_CHARS:
+        return False
+    if not (url.startswith("https://") or url.startswith("http://")):
+        return False
+    return " " not in url and "\n" not in url and "\t" not in url
 
 
 # ── storage ──────────────────────────────────────────────────────────────────
@@ -125,12 +156,18 @@ class Dispute:
     reason: str
     status: str  # PENDING_EVIDENCE | OPEN | RESOLVED
     evidence_deadline: u256
-    depositor_evidence: str
+    depositor_evidence: str  # party-authored description
     depositor_evidence_kind: str
-    depositor_evidence_hash: str
+    depositor_evidence_url: str  # artifact URL (the material evidence)
+    depositor_evidence_hash: str  # keccak of the acquired artifact snapshot
+    depositor_evidence_snapshot: str  # acquired artifact bytes, stored on-chain
+    depositor_evidence_verified: bool
     recipient_evidence: str
     recipient_evidence_kind: str
+    recipient_evidence_url: str
     recipient_evidence_hash: str
+    recipient_evidence_snapshot: str
+    recipient_evidence_verified: bool
     delivery_pct: u8
     quality_pct: u8
     resolution_reason: str
@@ -301,10 +338,16 @@ class EscrowJury(gl.Contract):
             evidence_deadline=u256(now + DEFAULT_EVIDENCE_WINDOW_SECONDS),
             depositor_evidence="",
             depositor_evidence_kind="",
+            depositor_evidence_url="",
             depositor_evidence_hash="",
+            depositor_evidence_snapshot="",
+            depositor_evidence_verified=False,
             recipient_evidence="",
             recipient_evidence_kind="",
+            recipient_evidence_url="",
             recipient_evidence_hash="",
+            recipient_evidence_snapshot="",
+            recipient_evidence_verified=False,
             delivery_pct=u8(0),
             quality_pct=u8(0),
             resolution_reason="",
@@ -324,7 +367,7 @@ class EscrowJury(gl.Contract):
         self,
         dispute_id: u256,
         evidence_kind: str,
-        evidence_hash: str,
+        evidence_url: str,
         evidence_details: str,
     ):
         d = self._dispute_or_revert(dispute_id)
@@ -343,31 +386,45 @@ class EscrowJury(gl.Contract):
 
         if evidence_kind not in VALID_EVIDENCE_KINDS:
             raise gl.vm.UserError("evidence kind must be one of: " + ", ".join(VALID_EVIDENCE_KINDS))
-        if not _is_hex_digest(evidence_hash):
-            raise gl.vm.UserError("evidence hash must be a 64-character hex string")
+        if not _is_valid_evidence_url(evidence_url):
+            raise gl.vm.UserError("evidence url must be an http(s) URL of at most 512 characters")
         if not (MIN_EVIDENCE_CHARS <= len(evidence_details) <= MAX_EVIDENCE_CHARS):
             raise gl.vm.UserError("evidence details must be 20-3000 characters")
-
-        # Bind the claimed hash to the exact bytes being stored. The details
-        # become the retrievable artifact in the dispute record; the hash is
-        # the canonical locator (onchain://evidence/<hash>).
-        computed = Keccak256()
-        computed.update(evidence_details.encode("utf-8"))
-        if computed.hexdigest() != evidence_hash:
-            raise gl.vm.UserError("evidence hash does not match evidence details")
 
         if slot == "depositor":
             if d.depositor_evidence != "":
                 raise gl.vm.UserError("depositor has already submitted evidence")
-            d.depositor_evidence = evidence_details
-            d.depositor_evidence_kind = evidence_kind
-            d.depositor_evidence_hash = evidence_hash
         else:
             if d.recipient_evidence != "":
                 raise gl.vm.UserError("recipient has already submitted evidence")
+
+        # Independently acquire the material evidence. Validators fetch the
+        # artifact, normalize it deterministically, and commit the exact
+        # bytes and their keccak hash to the dispute record. A failed fetch
+        # marks the evidence unverified instead of trusting the description.
+        verified = False
+        snapshot = ""
+        artifact_hash = ""
+        if evidence_url:
+            acquired = self._acquire_artifact(evidence_url)
+            if acquired is not None:
+                snapshot, artifact_hash = acquired
+                verified = True
+
+        if slot == "depositor":
+            d.depositor_evidence = evidence_details
+            d.depositor_evidence_kind = evidence_kind
+            d.depositor_evidence_url = evidence_url
+            d.depositor_evidence_hash = artifact_hash
+            d.depositor_evidence_snapshot = snapshot
+            d.depositor_evidence_verified = verified
+        else:
             d.recipient_evidence = evidence_details
             d.recipient_evidence_kind = evidence_kind
-            d.recipient_evidence_hash = evidence_hash
+            d.recipient_evidence_url = evidence_url
+            d.recipient_evidence_hash = artifact_hash
+            d.recipient_evidence_snapshot = snapshot
+            d.recipient_evidence_verified = verified
 
         self.disputes[dispute_id] = d
 
@@ -459,6 +516,45 @@ class EscrowJury(gl.Contract):
         self._decrement_locked(int(e.amount))
         _NativeRecipient(e.depositor).emit_transfer(value=u256(e.amount))
 
+    # ── evidence acquisition ────────────────────────────────────────────
+
+    def _acquire_artifact(self, url: str):
+        """Fetch an evidence artifact and commit its exact bytes via consensus.
+
+        Runs inside ``prompt_comparative`` so every validator independently
+        fetches and normalizes the artifact. The quorum only accepts the
+        submission when the snapshots carry the exact same hash, which is
+        what makes the stored bytes trustworthy: they are the bytes the
+        network actually saw, not a hash a party claimed.
+        """
+
+        def acquire() -> str:
+            try:
+                raw = gl.nondet.web.render(url, mode="text")
+            except Exception:
+                return json.dumps({"error": "unavailable"})
+            normalized = _normalize_content(str(raw))
+            if not normalized:
+                return json.dumps({"error": "unavailable"})
+            snapshot = normalized[:MAX_EVIDENCE_SNAPSHOT_CHARS]
+            return json.dumps({"snapshot": snapshot, "hash": _hash_text(snapshot)}, sort_keys=True)
+
+        principle = (
+            "Answers are equivalent only when both are unavailable errors, or when both "
+            "contain a snapshot and the exact same 64-character hash."
+        )
+        try:
+            result = json.loads(gl.eq_principle.prompt_comparative(acquire, principle))
+            if "error" in result:
+                return None
+            snapshot = str(result.get("snapshot", ""))
+            digest = str(result.get("hash", ""))
+            if not snapshot or digest != _hash_text(snapshot):
+                return None
+            return snapshot, digest
+        except Exception:
+            return None
+
     # ── adjudication ────────────────────────────────────────────────────
 
     def _run_adjudication(self, dispute_id: u256):
@@ -466,11 +562,30 @@ class EscrowJury(gl.Contract):
         e = self._escrow_or_revert(d.escrow_id)
 
         def do_adjudicate() -> str:
-            evidence_text = ""
-            if d.depositor_evidence:
-                evidence_text += f"Depositor evidence ({d.depositor_evidence_kind}):\n{d.depositor_evidence}\n\n"
-            if d.recipient_evidence:
-                evidence_text += f"Recipient evidence ({d.recipient_evidence_kind}):\n{d.recipient_evidence}\n"
+            def evidence_block(side: str) -> str:
+                if side == "depositor":
+                    details, kind = d.depositor_evidence, d.depositor_evidence_kind
+                    url, snapshot = d.depositor_evidence_url, d.depositor_evidence_snapshot
+                    verified = d.depositor_evidence_verified
+                else:
+                    details, kind = d.recipient_evidence, d.recipient_evidence_kind
+                    url, snapshot = d.recipient_evidence_url, d.recipient_evidence_snapshot
+                    verified = d.recipient_evidence_verified
+                if not details:
+                    return ""
+                status = (
+                    "ACQUIRED AND HASH-VERIFIED ON-CHAIN"
+                    if verified
+                    else "NOT ACQUIRED (no verifiable artifact)"
+                )
+                block = f"{side.capitalize()} evidence ({kind}): {status}\nDescription: {details}\n"
+                if url:
+                    block += f"Artifact URL: {url}\n"
+                if snapshot:
+                    block += f"Acquired artifact bytes:\n<<<ARTIFACT>>>\n{snapshot}\n<<<END ARTIFACT>>>\n"
+                return block + "\n"
+
+            evidence_text = evidence_block("depositor") + evidence_block("recipient")
 
             prompt = f"""You are a dispute arbitrator. Judge whether the terms were met.
 
@@ -484,6 +599,10 @@ EVIDENCE:
 {evidence_text if evidence_text else "Neither side submitted evidence."}
 
 Scoring rules:
+- Base delivery and quality primarily on the ACQUIRED ARTIFACT BYTES above versus the terms.
+  Party descriptions are secondary context only.
+- Evidence marked NOT ACQUIRED has no verifiable artifact: it carries minimal weight. Do not
+  award high delivery or quality on unverified claims alone, and state that in the reason.
 - delivery_pct: 0-100. 0 = nothing delivered. 100 = fully delivered.
 - quality_pct: 0-100. 0 = unacceptable. 100 = exactly as agreed.
 - The payout ratio is delivery_pct * quality_pct / 100. A zero on either axis zeroes the payout.
@@ -506,11 +625,17 @@ Do not include markdown or extra text before or after the JSON."""
                 sort_keys=True,
             )
 
-        principle = """Both answers are JSON arbitration verdicts. They are equivalent if and only if
-the product (delivery_pct * quality_pct) falls in the same thousand-bucket:
-0-999, 1000-1999, 2000-2999, ..., 9000-9999, 10000. The reason text may differ
-in wording as long as it supports the same outcome. If either answer contains
-an "error" key, they are equivalent only if both contain an "error" key."""
+        escrow_amount = int(e.amount)
+        principle = (
+            f"The escrow amount is {escrow_amount} GEN. Both answers are JSON arbitration "
+            "verdicts. They are equivalent if and only if the canonical recipient payout "
+            "they imply is EXACTLY equal, where canonical payout = "
+            f"floor({escrow_amount} * delivery_pct * quality_pct / 10000) in whole GEN. "
+            "Two verdicts that imply different payouts are NOT equivalent, even if the "
+            "scores look close. The reason text may differ in wording as long as it is "
+            "consistent with the scores. If either answer contains an 'error' key, they "
+            "are equivalent only if both contain an 'error' key."
+        )
 
         try:
             result_raw = gl.eq_principle.prompt_comparative(do_adjudicate, principle)
@@ -591,10 +716,16 @@ an "error" key, they are equivalent only if both contain an "error" key."""
             "evidence_deadline": int(d.evidence_deadline),
             "depositor_evidence": d.depositor_evidence,
             "depositor_evidence_kind": d.depositor_evidence_kind,
+            "depositor_evidence_url": d.depositor_evidence_url,
             "depositor_evidence_hash": d.depositor_evidence_hash,
+            "depositor_evidence_snapshot": d.depositor_evidence_snapshot,
+            "depositor_evidence_verified": bool(d.depositor_evidence_verified),
             "recipient_evidence": d.recipient_evidence,
             "recipient_evidence_kind": d.recipient_evidence_kind,
+            "recipient_evidence_url": d.recipient_evidence_url,
             "recipient_evidence_hash": d.recipient_evidence_hash,
+            "recipient_evidence_snapshot": d.recipient_evidence_snapshot,
+            "recipient_evidence_verified": bool(d.recipient_evidence_verified),
             "delivery_pct": int(d.delivery_pct),
             "quality_pct": int(d.quality_pct),
             "resolution_reason": d.resolution_reason,

@@ -1,13 +1,16 @@
 """Dispute flow: file, submit evidence, adjudicate, settle."""
 
+from eth_utils import keccak
+
 from tests.direct.conftest import (
     SHORT_REASON,
     DEPOSITOR_EVIDENCE,
-    DEPOSITOR_EVIDENCE_HASH,
     RECIPIENT_EVIDENCE,
-    RECIPIENT_EVIDENCE_HASH,
+    ARTIFACT_URL,
+    ARTIFACT_BODY,
     create_escrow,
     submit_evidence,
+    mock_artifact,
     mock_adjudication,
     set_time,
 )
@@ -76,27 +79,70 @@ def test_submit_evidence_both_sides(direct_vm, direct_deploy, direct_alice, dire
     eid = create_escrow(contract, direct_vm, direct_alice, direct_bob)
     did = _file(direct_vm, contract, eid, direct_alice)
 
-    submit_evidence(direct_vm, contract, did, "EXECUTION_LOG", DEPOSITOR_EVIDENCE_HASH, DEPOSITOR_EVIDENCE, direct_alice)
+    mock_artifact(direct_vm)
+    submit_evidence(direct_vm, contract, did, "EXECUTION_LOG", DEPOSITOR_EVIDENCE, direct_alice, url=ARTIFACT_URL)
     d = contract.get_dispute(did)
     assert d["depositor_evidence"] == DEPOSITOR_EVIDENCE
     assert d["depositor_evidence_kind"] == "EXECUTION_LOG"
-    assert d["depositor_evidence_hash"] == DEPOSITOR_EVIDENCE_HASH
+    assert d["depositor_evidence_url"] == ARTIFACT_URL
+    assert len(d["depositor_evidence_hash"]) == 64
+    assert d["depositor_evidence_snapshot"] != ""
+    assert d["depositor_evidence_verified"] is True
 
-    submit_evidence(direct_vm, contract, did, "TRANSACTION_RECEIPT", RECIPIENT_EVIDENCE_HASH, RECIPIENT_EVIDENCE, direct_bob)
+    submit_evidence(direct_vm, contract, did, "TRANSACTION_RECEIPT", RECIPIENT_EVIDENCE, direct_bob, url=ARTIFACT_URL)
     d = contract.get_dispute(did)
     assert d["recipient_evidence"] == RECIPIENT_EVIDENCE
     assert d["recipient_evidence_kind"] == "TRANSACTION_RECEIPT"
-    assert d["recipient_evidence_hash"] == RECIPIENT_EVIDENCE_HASH
+    assert d["recipient_evidence_url"] == ARTIFACT_URL
+    assert len(d["recipient_evidence_hash"]) == 64
+    assert d["recipient_evidence_snapshot"] != ""
+    assert d["recipient_evidence_verified"] is True
 
 
-def test_evidence_hash_must_match_details(direct_vm, direct_deploy, direct_alice, direct_bob):
+def test_evidence_artifact_acquired_and_stored(direct_vm, direct_deploy, direct_alice, direct_bob):
+    """The contract fetches the artifact and stores the exact bytes + hash."""
     contract = direct_deploy("contracts/escrow_jury.py")
     eid = create_escrow(contract, direct_vm, direct_alice, direct_bob)
     did = _file(direct_vm, contract, eid, direct_alice)
 
-    direct_vm.sender = direct_alice
-    with direct_vm.expect_revert("evidence hash does not match"):
-        contract.submit_dispute_evidence(did, "EXECUTION_LOG", "a" * 64, "Some evidence that does not hash to a repeated a string")
+    mock_artifact(direct_vm)
+    submit_evidence(direct_vm, contract, did, "SCREENSHOT", RECIPIENT_EVIDENCE, direct_bob, url=ARTIFACT_URL)
+
+    d = contract.get_dispute(did)
+    snapshot = d["depositor_evidence_snapshot"] if d["depositor_evidence"] else d["recipient_evidence_snapshot"]
+    digest = d["depositor_evidence_hash"] if d["depositor_evidence"] else d["recipient_evidence_hash"]
+    # The stored bytes normalize deterministically and hash to the committed digest.
+    normalized = "\n".join(l for l in [" ".join(x.split()).strip() for x in ARTIFACT_BODY.splitlines()] if l)
+    assert snapshot == normalized
+    assert digest == keccak(text=normalized).hex()
+
+
+def test_evidence_unavailable_marks_unverified(direct_vm, direct_deploy, direct_alice, direct_bob):
+    """A URL that cannot be fetched marks the evidence unverified, no revert."""
+    contract = direct_deploy("contracts/escrow_jury.py")
+    eid = create_escrow(contract, direct_vm, direct_alice, direct_bob)
+    did = _file(direct_vm, contract, eid, direct_alice)
+
+    # No web mock for this URL: the fetch raises, acquisition fails.
+    submit_evidence(direct_vm, contract, did, "ERROR_REPORT", DEPOSITOR_EVIDENCE, direct_alice, url="https://unreachable.example/x")
+
+    d = contract.get_dispute(did)
+    assert d["depositor_evidence_verified"] is False
+    assert d["depositor_evidence_hash"] == ""
+    assert d["depositor_evidence_snapshot"] == ""
+
+
+def test_evidence_without_url_is_unverified(direct_vm, direct_deploy, direct_alice, direct_bob):
+    """Text-only evidence has no acquired artifact and stays unverified."""
+    contract = direct_deploy("contracts/escrow_jury.py")
+    eid = create_escrow(contract, direct_vm, direct_alice, direct_bob)
+    did = _file(direct_vm, contract, eid, direct_alice)
+
+    submit_evidence(direct_vm, contract, did, "OTHER", DEPOSITOR_EVIDENCE, direct_alice)
+
+    d = contract.get_dispute(did)
+    assert d["depositor_evidence_verified"] is False
+    assert d["depositor_evidence_snapshot"] == ""
 
 
 def test_cannot_submit_evidence_twice(direct_vm, direct_deploy, direct_alice, direct_bob):
@@ -104,10 +150,10 @@ def test_cannot_submit_evidence_twice(direct_vm, direct_deploy, direct_alice, di
     eid = create_escrow(contract, direct_vm, direct_alice, direct_bob)
     did = _file(direct_vm, contract, eid, direct_alice)
 
-    submit_evidence(direct_vm, contract, did, "EXECUTION_LOG", DEPOSITOR_EVIDENCE_HASH, DEPOSITOR_EVIDENCE, direct_alice)
+    submit_evidence(direct_vm, contract, did, "EXECUTION_LOG", DEPOSITOR_EVIDENCE, direct_alice)
 
     with direct_vm.expect_revert("already submitted"):
-        submit_evidence(direct_vm, contract, did, "ERROR_REPORT", DEPOSITOR_EVIDENCE_HASH, DEPOSITOR_EVIDENCE, direct_alice)
+        submit_evidence(direct_vm, contract, did, "ERROR_REPORT", DEPOSITOR_EVIDENCE, direct_alice)
 
 
 def test_evidence_validation_fields(direct_vm, direct_deploy, direct_alice, direct_bob):
@@ -117,13 +163,16 @@ def test_evidence_validation_fields(direct_vm, direct_deploy, direct_alice, dire
     direct_vm.sender = direct_alice
 
     with direct_vm.expect_revert("evidence kind must be"):
-        contract.submit_dispute_evidence(did, "NOT_A_KIND", DEPOSITOR_EVIDENCE_HASH, DEPOSITOR_EVIDENCE)
+        contract.submit_dispute_evidence(did, "NOT_A_KIND", "", DEPOSITOR_EVIDENCE)
 
-    with direct_vm.expect_revert("evidence hash must be"):
-        contract.submit_dispute_evidence(did, "ERROR_REPORT", "too-short", DEPOSITOR_EVIDENCE)
+    with direct_vm.expect_revert("evidence url must be"):
+        contract.submit_dispute_evidence(did, "ERROR_REPORT", "ftp://not-http.example/x", DEPOSITOR_EVIDENCE)
+
+    with direct_vm.expect_revert("evidence url must be"):
+        contract.submit_dispute_evidence(did, "ERROR_REPORT", "not a url", DEPOSITOR_EVIDENCE)
 
     with direct_vm.expect_revert("details must be 20"):
-        contract.submit_dispute_evidence(did, "ERROR_REPORT", DEPOSITOR_EVIDENCE_HASH, "ab")
+        contract.submit_dispute_evidence(did, "ERROR_REPORT", "", "ab")
 
 
 def test_finalize_needs_evidence(direct_vm, direct_deploy, direct_alice, direct_bob):
@@ -166,8 +215,8 @@ def test_partial_payout(direct_vm, direct_deploy, direct_alice, direct_bob):
     eid = create_escrow(contract, direct_vm, direct_alice, direct_bob, amount=1000)
     did = _file(direct_vm, contract, eid, direct_alice)
 
-    submit_evidence(direct_vm, contract, did, "EXECUTION_LOG", DEPOSITOR_EVIDENCE_HASH, DEPOSITOR_EVIDENCE, direct_alice)
-    submit_evidence(direct_vm, contract, did, "TRANSACTION_RECEIPT", RECIPIENT_EVIDENCE_HASH, RECIPIENT_EVIDENCE, direct_bob)
+    submit_evidence(direct_vm, contract, did, "EXECUTION_LOG", DEPOSITOR_EVIDENCE, direct_alice)
+    submit_evidence(direct_vm, contract, did, "TRANSACTION_RECEIPT", RECIPIENT_EVIDENCE, direct_bob)
 
     set_time("2030-01-02T00:00:00Z")
     # delivery 80%, quality 50% -> product 4000 -> 40% payout
@@ -186,8 +235,8 @@ def test_settle_dispute_payout_and_guard(direct_vm, direct_deploy, direct_alice,
     eid = create_escrow(contract, direct_vm, direct_alice, direct_bob, amount=1000)
     did = _file(direct_vm, contract, eid, direct_alice)
 
-    submit_evidence(direct_vm, contract, did, "EXECUTION_LOG", DEPOSITOR_EVIDENCE_HASH, DEPOSITOR_EVIDENCE, direct_alice)
-    submit_evidence(direct_vm, contract, did, "TRANSACTION_RECEIPT", RECIPIENT_EVIDENCE_HASH, RECIPIENT_EVIDENCE, direct_bob)
+    submit_evidence(direct_vm, contract, did, "EXECUTION_LOG", DEPOSITOR_EVIDENCE, direct_alice)
+    submit_evidence(direct_vm, contract, did, "TRANSACTION_RECEIPT", RECIPIENT_EVIDENCE, direct_bob)
 
     set_time("2030-01-02T00:00:00Z")
     mock_adjudication(direct_vm, delivery_pct=80, quality_pct=50)
@@ -232,8 +281,8 @@ def test_retry_dispute_after_failure(direct_vm, direct_deploy, direct_alice, dir
     eid = create_escrow(contract, direct_vm, direct_alice, direct_bob)
     did = _file(direct_vm, contract, eid, direct_alice)
 
-    submit_evidence(direct_vm, contract, did, "EXECUTION_LOG", DEPOSITOR_EVIDENCE_HASH, DEPOSITOR_EVIDENCE, direct_alice)
-    submit_evidence(direct_vm, contract, did, "TRANSACTION_RECEIPT", RECIPIENT_EVIDENCE_HASH, RECIPIENT_EVIDENCE, direct_bob)
+    submit_evidence(direct_vm, contract, did, "EXECUTION_LOG", DEPOSITOR_EVIDENCE, direct_alice)
+    submit_evidence(direct_vm, contract, did, "TRANSACTION_RECEIPT", RECIPIENT_EVIDENCE, direct_bob)
 
     set_time("2030-01-02T00:00:00Z")
     # First attempt: simulate an unparseable verdict
@@ -267,8 +316,8 @@ def test_retry_dispute_throttled(direct_vm, direct_deploy, direct_alice, direct_
     eid = create_escrow(contract, direct_vm, direct_alice, direct_bob)
     did = _file(direct_vm, contract, eid, direct_alice)
 
-    submit_evidence(direct_vm, contract, did, "EXECUTION_LOG", DEPOSITOR_EVIDENCE_HASH, DEPOSITOR_EVIDENCE, direct_alice)
-    submit_evidence(direct_vm, contract, did, "TRANSACTION_RECEIPT", RECIPIENT_EVIDENCE_HASH, RECIPIENT_EVIDENCE, direct_bob)
+    submit_evidence(direct_vm, contract, did, "EXECUTION_LOG", DEPOSITOR_EVIDENCE, direct_alice)
+    submit_evidence(direct_vm, contract, did, "TRANSACTION_RECEIPT", RECIPIENT_EVIDENCE, direct_bob)
 
     set_time("2030-01-02T00:00:00Z")
     mock_adjudication(direct_vm, delivery_pct=-1, quality_pct=-1)
@@ -288,8 +337,8 @@ def test_cannot_retry_resolved(direct_vm, direct_deploy, direct_alice, direct_bo
     eid = create_escrow(contract, direct_vm, direct_alice, direct_bob)
     did = _file(direct_vm, contract, eid, direct_alice)
 
-    submit_evidence(direct_vm, contract, did, "EXECUTION_LOG", DEPOSITOR_EVIDENCE_HASH, DEPOSITOR_EVIDENCE, direct_alice)
-    submit_evidence(direct_vm, contract, did, "TRANSACTION_RECEIPT", RECIPIENT_EVIDENCE_HASH, RECIPIENT_EVIDENCE, direct_bob)
+    submit_evidence(direct_vm, contract, did, "EXECUTION_LOG", DEPOSITOR_EVIDENCE, direct_alice)
+    submit_evidence(direct_vm, contract, did, "TRANSACTION_RECEIPT", RECIPIENT_EVIDENCE, direct_bob)
 
     set_time("2030-01-02T00:00:00Z")
     mock_adjudication(direct_vm, delivery_pct=100, quality_pct=100)

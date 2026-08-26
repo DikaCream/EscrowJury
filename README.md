@@ -7,9 +7,9 @@ A GenLayer Intelligent Contract primitive for escrow and dispute resolution — 
 There's no marketplace, no sales pipeline, no skill listings. Just escrow and adjudication. Any contract or dapp that needs buyer-seller escrow with AI-backed dispute resolution can drop this in — the API is four write calls for a full lifecycle.
 
 - **Immutable terms.** Terms are hashed at creation and never re-fetched. Validators only see the snapshot that was locked in when the escrow was funded.
-- **Evidence that stays on chain.** Each side submits raw details that the contract hashes with Keccak-256 and stores in the dispute record. Mismatched hashes revert. External URLs aren't accepted — the hash locates the canonical bytes in the dispute data itself.
+- **Evidence the contract acquires itself.** Evidence is an artifact URL plus a short description. At submission, validators independently fetch the artifact, normalize it deterministically, and commit the exact bytes and their Keccak-256 hash to the dispute record through consensus. Adjudication judges those acquired bytes, not the parties' retellings.
 - **Two-axis scoring.** Validators score delivery (did the work happen?) and quality (was it good?) on 0-100 scales. The product gives the payout ratio. A zero on either axis zeroes the payout.
-- **Bucket equivalence.** Two verdicts agree when their payout products land in the same thousand-bucket (0-999, 1000-1999, ..., 9000-9999, 10000). Validators who weigh delivery and quality differently can still reach consensus as long as the final split is the same.
+- **Exact-payout consensus.** Two verdicts are equivalent only when they imply the exact same payout in whole GEN (floor(amount * delivery_pct * quality_pct / 10000)). Scores that differ by even one point on a large escrow are not equivalent, so consensus is bound to the money, not to a score bucket.
 - **Evidence window.** Filing a dispute opens a 24-hour window. Validators aren't called until both sides submit or the clock runs out. No one gets ambushed by an AI verdict before they've had a chance to make their case.
 
 ## Lifecycle
@@ -17,8 +17,8 @@ There's no marketplace, no sales pipeline, no skill listings. Just escrow and ad
 1. **Deposit.** The depositor locks GEN plus the terms, naming a recipient. The contract hashes and stores the terms. Status: ACTIVE.
 2. **Release or refund.** The depositor can release funds to the recipient at any time. After the auto-release deadline (7 days), anyone can release or refund.
 3. **Dispute.** Either side files a dispute with a written reason. The escrow becomes DISPUTED. A 24-hour evidence deadline starts ticking.
-4. **Evidence.** Buyer and seller each submit one structured record: a kind (EXECUTION_LOG, ERROR_REPORT, TRANSACTION_RECEIPT, SCREENSHOT, OTHER), the evidence bytes, and a hash that the contract verifies on-chain.
-5. **Adjudication.** Once both sides submit or the evidence deadline passes, anyone calls finalize. Validators read the terms, the complaint, and the evidence. They return delivery_pct and quality_pct. The contract computes the payout.
+4. **Evidence.** Buyer and seller each submit one structured record: a kind (EXECUTION_LOG, ERROR_REPORT, TRANSACTION_RECEIPT, SCREENSHOT, OTHER), the artifact URL (the material evidence), and a short description. Validators fetch the artifact, normalize it, and commit its bytes plus keccak hash to the dispute record. If the artifact can't be acquired, the evidence is marked unverified.
+5. **Adjudication.** Once both sides submit or the evidence deadline passes, anyone calls finalize. Validators read the terms, the complaint, the description, and the acquired artifact bytes. They return delivery_pct and quality_pct, and consensus requires the exact payout to match. The contract computes the payout.
 6. **Settle.** Anyone calls settle to distribute funds. Payout to recipient = amount * delivery_pct * quality_pct / 10000. Remainder returns to depositor.
 7. **Stale close.** If a dispute stays unresolved for 7 days after the evidence deadline, anyone can close it — the full amount refunds to the depositor.
 
@@ -32,7 +32,7 @@ There's no marketplace, no sales pipeline, no skill listings. Just escrow and ad
 | `release_escrow` | escrow_id | Sends escrow funds to recipient. Depositor only before deadline; anyone after. |
 | `refund_escrow` | escrow_id | Returns escrow funds to depositor. Only after auto-release deadline. |
 | `file_dispute` | escrow_id, reason | Opens a dispute. Either party. |
-| `submit_dispute_evidence` | dispute_id, kind, hash, details | Submits one evidence record. Hash verified on-chain with Keccak-256. |
+| `submit_dispute_evidence` | dispute_id, kind, url, details | Submits one evidence record. Validators fetch the artifact URL and commit its bytes + keccak hash on-chain. |
 | `finalize_dispute` | dispute_id | Starts validator adjudication. Requires both evidence or expired deadline. |
 | `retry_dispute` | dispute_id | Re-runs adjudication after a failed verdict. Throttled. |
 | `settle_dispute` | dispute_id | Distributes funds per the adjudication verdict. |
@@ -45,7 +45,7 @@ There's no marketplace, no sales pipeline, no skill listings. Just escrow and ad
 | `get_config` | — | escrow_count, dispute_count, escrow_locked, window configs |
 | `get_escrow` | escrow_id | Escrow fields (terms omitted; see get_escrow_terms) |
 | `get_escrow_terms` | escrow_id | terms_hash, terms_snapshot (the committed terms) |
-| `get_dispute` | dispute_id | Full dispute record including evidence, verdict, status |
+| `get_dispute` | dispute_id | Full dispute record including acquired evidence bytes + hash, verdict, status |
 | `list_escrows` | offset, limit | Paginated list of all escrows |
 | `list_depositor_escrows` | address, offset, limit | Escrows by depositor |
 | `list_recipient_escrows` | address, offset, limit | Escrows by recipient |
@@ -85,14 +85,18 @@ genlayer deploy --contract contracts/escrow_jury.py
 
 ## Consensus design
 
-EscrowJury uses `gl.eq_principle.prompt_comparative` for the two-axis adjudication. The validator prompt asks for `delivery_pct` and `quality_pct` as separate integers. Two verdicts are equivalent when their product falls in the same thousand-bucket — the reason text can differ.
+EscrowJury uses `gl.eq_principle.prompt_comparative` for both evidence acquisition and adjudication.
 
-This means a validator who scores (100 delivery, 50 quality) agrees with one who scores (50 delivery, 100 quality). Both produce a 5000 product and a 50% payout. The contract doesn't care which axis was penalized, only that the resulting split is consistent across the quorum.
+**Evidence acquisition.** When a party submits evidence, the equivalence principle requires every validator's independently fetched snapshot to carry the exact same keccak hash. Only then are the bytes stored. This is what makes the stored evidence trustworthy: it is the bytes the network actually saw, not a hash a party claimed. A fetch that fails marks the evidence unverified, and the judge is instructed to give unverified claims minimal weight.
 
-For evidence integrity, every submission passes through `Keccak256(evidence_details) == evidence_hash` on-chain. The raw details live in the dispute record and are retrievable through `get_dispute`. Validators see the stored bytes, not a URL the parties control.
+**Adjudication.** The validator prompt asks for `delivery_pct` and `quality_pct` as separate integers, judged primarily against the acquired artifact bytes. Two verdicts are equivalent if and only if they imply the exact same canonical payout, `floor(escrow_amount * delivery_pct * quality_pct / 10000)` in whole GEN — the amount is embedded in the equivalence principle so validators can compute it. The reason text may differ in wording. This means validators who score (100 delivery, 50 quality) and (50 delivery, 100 quality) still agree (both imply a 50% payout), but a 49% vs 50% split does not: consensus is bound to the payout, not to a bucket.
+
+If the quorum can't agree on a payout, the dispute stays OPEN and `retry_dispute` re-runs adjudication after a throttle window.
 
 ## Status
 
-31 direct tests covering escrow lifecycle, evidence validation, hash binding, adjudication mocks, stale closing, and full-path integration.
+37 direct tests covering escrow lifecycle, evidence validation, artifact acquisition and verification, adjudication, stale closing, and full-path integration.
 
-**Live on StudioNet:** `0x127b77569F2d124eC3bb81308fD012ef26F5DfbC` ([Studio explorer](https://explorer-studio.genlayer.com/address/0x127b77569F2d124eC3bb81308fD012ef26F5DfbC))
+The full lifecycle was live-tested on StudioNet: create escrow, file dispute, submit evidence on both sides (validators fetched example.com and committed matching snapshots, verified on-chain), adjudicate (verdict grounded in the acquired artifact bytes), and settle (escrow_locked released).
+
+**Live on StudioNet:** `0x3c3d66A8c0a399C119Ee7a3d0e8923Fb8Ee5dD1A` ([Studio explorer](https://explorer-studio.genlayer.com/address/0x3c3d66A8c0a399C119Ee7a3d0e8923Fb8Ee5dD1A))
