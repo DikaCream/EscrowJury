@@ -99,4 +99,4 @@ If the quorum can't agree on a payout, the dispute stays OPEN and `retry_dispute
 
 The full lifecycle was live-tested on StudioNet: create escrow, file dispute, submit evidence on both sides (validators fetched example.com and committed matching snapshots, verified on-chain), adjudicate (verdict grounded in the acquired artifact bytes), and settle (escrow_locked released).
 
-**Live on StudioNet:** `0x3c3d66A8c0a399C119Ee7a3d0e8923Fb8Ee5dD1A` ([Studio explorer](https://explorer-studio.genlayer.com/address/0x3c3d66A8c0a399C119Ee7a3d0e8923Fb8Ee5dD1A))
+**Live on StudioNet:** `0xb1AA0ae2CD3b4fa4721E459371a708cD490b96c4` ([Studio explorer](https://explorer-studio.genlayer.com/address/0xb1AA0ae2CD3b4fa4721E459371a708cD490b96c4))
