@@ -67,17 +67,18 @@ def test_release_escrow_by_depositor(direct_vm, direct_deploy, direct_alice, dir
     assert e["status"] == "RELEASED"
 
 
-def test_release_escrow_after_deadline(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
+def test_release_escrow_after_deadline_still_requires_depositor(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
     contract = direct_deploy("contracts/escrow_jury.py")
     eid = create_escrow(contract, direct_vm, direct_alice, direct_bob)
 
-    e = contract.get_escrow(eid)
     set_time("2030-01-09T00:00:00Z")  # past the 7-day auto-release deadline
     direct_vm.sender = direct_charlie
-    contract.release_escrow(eid)
+    with direct_vm.expect_revert("only the depositor can release"):
+        contract.release_escrow(eid)
 
-    e = contract.get_escrow(eid)
-    assert e["status"] == "RELEASED"
+    direct_vm.sender = direct_alice
+    contract.release_escrow(eid)
+    assert contract.get_escrow(eid)["status"] == "RELEASED"
 
 
 def test_cannot_release_before_deadline_by_third_party(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):

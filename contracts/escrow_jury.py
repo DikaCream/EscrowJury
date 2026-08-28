@@ -288,10 +288,10 @@ class EscrowJury(gl.Contract):
         e = self._escrow_or_revert(escrow_id)
         if e.status != ACTIVE:
             raise gl.vm.UserError("escrow is not active")
-        sender = gl.message.sender_address
-        if sender != e.depositor:
-            if self._now() < int(e.auto_release_deadline):
-                raise gl.vm.UserError("only the depositor can release before the deadline")
+        # Release is an affirmative depositor action. A timeout never grants
+        # arbitrary callers the right to choose the beneficiary.
+        if gl.message.sender_address != e.depositor:
+            raise gl.vm.UserError("only the depositor can release escrow")
 
         e.status = RELEASED
         self.escrows[escrow_id] = e
@@ -305,6 +305,8 @@ class EscrowJury(gl.Contract):
             raise gl.vm.UserError("escrow is not active")
         if self._now() < int(e.auto_release_deadline):
             raise gl.vm.UserError("escrow cannot be refunded before the auto-release deadline")
+        # After the deadline, refund is the single timeout outcome and is
+        # callable by anyone, so keepers can finalize abandoned escrows.
 
         e.status = REFUNDED
         self.escrows[escrow_id] = e
@@ -507,11 +509,19 @@ class EscrowJury(gl.Contract):
             raise gl.vm.UserError("dispute is not yet stale")
 
         e = self._escrow_or_revert(d.escrow_id)
+        if e.status != DISPUTED:
+            raise gl.vm.UserError("escrow is not in disputed state")
+
+        # A stale dispute has one deterministic outcome: full refund. Update
+        # both records atomically before transferring, leaving no ambiguous
+        # DISPUTED escrow behind and preventing a second payout path.
         d.delivery_pct = u8(0)
         d.quality_pct = u8(0)
         d.resolution_reason = "stale dispute closed; full refund"
         d.status = RESOLVED
+        e.status = REFUNDED
         self.disputes[dispute_id] = d
+        self.escrows[d.escrow_id] = e
 
         self._decrement_locked(int(e.amount))
         _NativeRecipient(e.depositor).emit_transfer(value=u256(e.amount))

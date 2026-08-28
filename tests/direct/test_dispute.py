@@ -265,6 +265,7 @@ def test_close_stale_dispute(direct_vm, direct_deploy, direct_alice, direct_bob)
     d = contract.get_dispute(did)
     assert d["status"] == "RESOLVED"
     assert d["resolution_reason"] != ""
+    assert contract.get_escrow(eid)["status"] == "REFUNDED"
 
 
 def test_cannot_close_non_stale(direct_vm, direct_deploy, direct_alice, direct_bob):

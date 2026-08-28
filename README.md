@@ -15,12 +15,12 @@ There's no marketplace, no sales pipeline, no skill listings. Just escrow and ad
 ## Lifecycle
 
 1. **Deposit.** The depositor locks GEN plus the terms, naming a recipient. The contract hashes and stores the terms. Status: ACTIVE.
-2. **Release or refund.** The depositor can release funds to the recipient at any time. After the auto-release deadline (7 days), anyone can release or refund.
+2. **Release or refund.** Only the depositor can release funds to the recipient. After the auto-release deadline (7 days), refund to the depositor is the single deterministic timeout outcome and anyone may call it as a keeper.
 3. **Dispute.** Either side files a dispute with a written reason. The escrow becomes DISPUTED. A 24-hour evidence deadline starts ticking.
 4. **Evidence.** Buyer and seller each submit one structured record: a kind (EXECUTION_LOG, ERROR_REPORT, TRANSACTION_RECEIPT, SCREENSHOT, OTHER), the artifact URL (the material evidence), and a short description. Validators fetch the artifact, normalize it, and commit its bytes plus keccak hash to the dispute record. If the artifact can't be acquired, the evidence is marked unverified.
 5. **Adjudication.** Once both sides submit or the evidence deadline passes, anyone calls finalize. Validators read the terms, the complaint, the description, and the acquired artifact bytes. They return delivery_pct and quality_pct, and consensus requires the exact payout to match. The contract computes the payout.
 6. **Settle.** Anyone calls settle to distribute funds. Payout to recipient = amount * delivery_pct * quality_pct / 10000. Remainder returns to depositor.
-7. **Stale close.** If a dispute stays unresolved for 7 days after the evidence deadline, anyone can close it — the full amount refunds to the depositor.
+7. **Stale close.** If a dispute stays unresolved for 7 days after the evidence deadline, anyone can close it. The dispute becomes RESOLVED with a zero payout and the escrow itself becomes REFUNDED before the full amount is returned to the depositor.
 
 ## Contract API
 
@@ -29,14 +29,14 @@ There's no marketplace, no sales pipeline, no skill listings. Just escrow and ad
 | Method | Args | Description |
 |---|---|---|
 | `create_escrow` | recipient (Address), terms, evidence_window_days, auto_release_days | Deposits GEN, stores immutable terms. Payable. |
-| `release_escrow` | escrow_id | Sends escrow funds to recipient. Depositor only before deadline; anyone after. |
-| `refund_escrow` | escrow_id | Returns escrow funds to depositor. Only after auto-release deadline. |
+| `release_escrow` | escrow_id | Sends escrow funds to recipient. Only the depositor may call it, before or after the deadline. |
+| `refund_escrow` | escrow_id | Returns escrow funds to depositor. Anyone may call it after the deadline; refund is the only timeout outcome. |
 | `file_dispute` | escrow_id, reason | Opens a dispute. Either party. |
 | `submit_dispute_evidence` | dispute_id, kind, url, details | Submits one evidence record. Validators fetch the artifact URL and commit its bytes + keccak hash on-chain. |
 | `finalize_dispute` | dispute_id | Starts validator adjudication. Requires both evidence or expired deadline. |
 | `retry_dispute` | dispute_id | Re-runs adjudication after a failed verdict. Throttled. |
 | `settle_dispute` | dispute_id | Distributes funds per the adjudication verdict. |
-| `close_stale_dispute` | dispute_id | Refunds depositor if dispute stayed open too long. |
+| `close_stale_dispute` | dispute_id | Deterministically refunds the depositor, marks the dispute RESOLVED and escrow REFUNDED, and can be called by anyone after the stale threshold. |
 
 ### View methods
 
